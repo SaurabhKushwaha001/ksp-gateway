@@ -1,3 +1,6 @@
-fn main() {
-    println!("Hello, world!");
+pub mod orchestrator;
+
+#[tokio::main]
+async fn main() {
+    println!("KSP Gateway orchestrator ready");
 }

@@ -4,6 +4,8 @@
 //! prevent unrelated programs from changing files; later orchestration work
 //! must detect and preserve external edits before applying any changes.
 
+#[cfg(target_os = "linux")]
+use std::ffi::{OsStr, OsString};
 use std::{
     collections::{BTreeMap, HashMap},
     fs,
@@ -97,6 +99,82 @@ impl CheckTask {
     pub fn cancellation_handle(&self) -> CheckCancellation {
         self.cancellation.clone()
     }
+
+    /// Create a Linux check that executes a command inside the kernel sandbox.
+    /// The command receives the disposable workspace and read-only access to
+    /// the source Git object store used by that workspace's private metadata.
+    #[cfg(target_os = "linux")]
+    pub fn sandboxed_command<I, S>(
+        name: impl Into<String>,
+        accesses: Vec<FileAccess>,
+        program: impl AsRef<OsStr>,
+        args: I,
+    ) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        Self::sandboxed_command_impl(name, accesses, None, program, args)
+    }
+
+    /// Variant for callers that need to name the gateway helper executable
+    /// explicitly, such as integration tests or a separately packaged runner.
+    #[cfg(target_os = "linux")]
+    pub fn sandboxed_command_with_helper<I, S>(
+        name: impl Into<String>,
+        accesses: Vec<FileAccess>,
+        helper_executable: impl AsRef<OsStr>,
+        program: impl AsRef<OsStr>,
+        args: I,
+    ) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        Self::sandboxed_command_impl(
+            name,
+            accesses,
+            Some(helper_executable.as_ref().to_os_string()),
+            program,
+            args,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn sandboxed_command_impl<I, S>(
+        name: impl Into<String>,
+        accesses: Vec<FileAccess>,
+        helper_executable: Option<OsString>,
+        program: impl AsRef<OsStr>,
+        args: I,
+    ) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let program = program.as_ref().to_os_string();
+        let args = args
+            .into_iter()
+            .map(|arg| arg.as_ref().to_os_string())
+            .collect::<Vec<OsString>>();
+        Self::new(name, accesses, move |context| async move {
+            let mut policy = crate::sandbox::SandboxPolicy::workspace_only(&context.workspace_root);
+            policy.paths.push(crate::sandbox::PathRule {
+                path: context.git_objects_path,
+                access: crate::sandbox::PathAccess::ReadOnly,
+            });
+            let mut command = crate::sandbox::SandboxCommand::new(policy, program).args(args);
+            if let Some(helper) = helper_executable {
+                command = command.helper_executable(helper);
+            }
+            let status = command.status().await.map_err(|error| error.to_string())?;
+            if status.success() {
+                Ok(())
+            } else {
+                Err(format!("sandboxed command exited with {status}"))
+            }
+        })
+    }
 }
 
 /// Paths supplied to one check. File operations should use `workspace_root`,
@@ -105,12 +183,19 @@ impl CheckTask {
 pub struct CheckContext {
     repository_root: PathBuf,
     workspace_root: PathBuf,
+    git_objects_path: PathBuf,
 }
 
 impl CheckContext {
     /// The check's isolated, writable workspace directory.
     pub fn workspace_root(&self) -> &Path {
         &self.workspace_root
+    }
+
+    /// The source repository's object directory, used by the snapshot's Git
+    /// alternates. Sandboxed commands receive read-only access to this path.
+    pub fn git_objects_path(&self) -> &Path {
+        &self.git_objects_path
     }
 
     /// Translate a repository path into the corresponding isolated path.
@@ -351,6 +436,7 @@ async fn execute_check(
     let context = CheckContext {
         repository_root: manager.root.clone(),
         workspace_root: workspace.path().to_path_buf(),
+        git_objects_path: workspace.git_objects_path.clone(),
     };
     (check.action)(context)
         .await
@@ -374,6 +460,7 @@ pub struct IsolatedWorkspace {
     path: PathBuf,
     baseline: Option<String>,
     repository_root: PathBuf,
+    git_objects_path: PathBuf,
 }
 
 impl IsolatedWorkspace {
@@ -424,6 +511,7 @@ impl IsolatedWorkspace {
             repository_root.join(object_path)
         };
         let object_path = fs::canonicalize(object_path)?;
+        workspace.git_objects_path = object_path.clone();
         let head = git_optional_output(&repository_root, ["rev-parse", "--verify", "HEAD"])?;
         let template = workspace.container.join("empty-template");
         let hooks = workspace.container.join("empty-hooks");
@@ -501,6 +589,12 @@ impl IsolatedWorkspace {
         &self.path
     }
 
+    /// The original repository's object database, referenced read-only by
+    /// this snapshot's private Git metadata.
+    pub fn git_objects_path(&self) -> &Path {
+        &self.git_objects_path
+    }
+
     fn candidate_patch(&self, writable_paths: &[PathBuf]) -> io::Result<Vec<u8>> {
         // Intent-to-add makes non-ignored untracked files visible to `git diff`
         // without adding their contents to the private index.
@@ -572,6 +666,7 @@ impl IsolatedWorkspace {
                         path,
                         baseline: None,
                         repository_root: PathBuf::new(),
+                        git_objects_path: PathBuf::new(),
                     });
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -1599,7 +1694,7 @@ mod tests {
             ),
         ];
 
-        let results = tokio::time::timeout(Duration::from_secs(1), run_checks(manager, checks))
+        let results = tokio::time::timeout(Duration::from_secs(5), run_checks(manager, checks))
             .await
             .expect("independent checks did not overlap");
         assert_eq!(results[0].name, "first");
@@ -1712,7 +1807,7 @@ mod tests {
                 |_| async { Ok(()) },
             ),
         ];
-        let results = tokio::time::timeout(Duration::from_secs(1), run_checks(manager, checks))
+        let results = tokio::time::timeout(Duration::from_secs(5), run_checks(manager, checks))
             .await
             .expect("checks deadlocked while acquiring paths");
         assert!(

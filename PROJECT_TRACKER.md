@@ -292,6 +292,28 @@ This estimate tracks the Kernel Sandbox feature only.
 - [ ] Keep synopsis/presentation deliverables separate; implementation is the
       priority in this repository.
 
+## Completion plan (2026-10-27)
+
+Phases 1–2 were ~95% done with 38 passing tests. The remaining phases are
+built test-first (write a failing unit/integration test, implement, refactor)
+on `feature/attestation`, branched from `feature/kernel-sandbox` at `7e0f7ec`
+because the sandbox is not yet merged into `develop`. Team review decides how
+it is integrated.
+
+| Step | Module | Deliverable | Tests first |
+|---|---|---|---|
+| A | `src/attestation.rs` | Versioned canonical payload bound to the staged tree OID and parents; Ed25519 key generation/storage (0600, outside the repo); sign/verify; commit-message trailer embed/extract; trust store with revocation | round-trip, tamper, wrong key, revoked key, malformed input, key-file permissions |
+| B | `src/bouncer.rs` | `pre-receive` verifier: enumerate pushed commits, verify signature, tree/parent binding, required checks, allowed policy digests, ref deletions | missing/invalid/tampered attestations, `--no-verify` commits, merges |
+| C | `src/scanner.rs` | Heuristic semantic firewall over added diff lines: agent-targeting instructions, hidden Unicode, pipe-to-shell, hook bypass, credential paths, secret material; bounded input; severity → block/warn | detections, benign false-positive cases, evasions, size bound |
+| D | `src/orchestrator.rs`, `src/policy.rs` | Staged-index snapshot mode so checks see exactly what will be committed; TOML gateway policy (checks, timeouts, scanner settings) with SHA-256 digest | staged vs unstaged content, policy parsing/validation |
+| E | `src/gateway.rs`, `src/main.rs` | `pre-commit` pipeline (scanner + secrets + sandboxed command checks via the orchestrator), signed pending attestation, `commit-msg` trailer, `install`, `keygen`, `verify-commit`, `pre-receive`, `scan`, `bench` | unit tests for pipeline decisions |
+| F | `tests/end_to_end.rs` | Real Git repos and a bare server with the hook: allowed push, rejected `--no-verify`, tampered message, wrong/revoked key, malicious diff blocked | — |
+| G | docs | README, tracker, threat model, demo script, latency method | — |
+
+The ONNX/`ort` model sidecar is deferred: it needs a downloaded model and
+cannot be validated tonight. Step C defines a `Detector` trait so a model
+backend can be added later; the shipped detector is heuristic only.
+
 ## Decisions and implementation notes
 
 - **Feature branches:** Before starting each feature, create a new branch from

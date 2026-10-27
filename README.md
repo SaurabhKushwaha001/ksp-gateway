@@ -1,18 +1,95 @@
 # KSP Gateway
 
 KSP Gateway is a zero-trust pre-commit security gateway for AI-assisted
-software engineering. It is being built in phases so that the orchestration
-spine is in place before sandboxing and policy checks are added.
+software engineering. Before a commit is created it scans the staged diff for
+text aimed at AI coding agents and for committed secrets, runs policy checks
+inside a Linux kernel sandbox against exactly the staged content, and signs an
+Ed25519 attestation into the commit message. A server-side `pre-receive` hook
+rejects any pushed commit without a valid attestation, so skipping the local
+hooks with `git commit --no-verify` does not get code onto the server.
 
-## Build order
+## Layers
 
-1. Orchestrator: coordinate checks and safe access to the working tree.
-2. Linux kernel sandbox: Landlock path rules and seccomp syscall rules.
-3. Commit attestation and a server-side receive hook.
-4. Best-effort AI semantic scanning of diffs.
-5. Integration, tests, latency measurement, and demo documentation.
+| Layer | Module | Enforcement |
+|---|---|---|
+| Orchestrator | `src/orchestrator.rs` | In-process coordination of checks over disposable Git snapshots |
+| Kernel sandbox | `src/sandbox.rs` | OS-enforced: no-new-privileges → Landlock → seccomp |
+| Semantic firewall | `src/scanner.rs` | Heuristic, best-effort detection over added diff lines |
+| Attestation | `src/attestation.rs`, `src/gateway.rs` | Local Ed25519 signature bound to tree, parents, policy, and checks |
+| Server bouncer | `src/bouncer.rs` | Server-enforced: `pre-receive` rejects unattested commits |
 
-## Current implementation
+See [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) for what each layer does and
+does not guarantee, and [`docs/DEMO.md`](docs/DEMO.md) for a scripted demo.
+
+## Quick start
+
+```sh
+cargo build --release --locked
+gw="$PWD/target/release/ksp-gateway"
+
+# Developer machine: create a key (kept outside the repository, mode 0600)
+"$gw" keygen > my-public-key.txt
+# Install the hooks and the default policy into an existing clone
+"$gw" install --repo /path/to/clone
+
+# Server: trust the developer key and install the verifier
+cat my-public-key.txt >> /srv/ksp/trusted-keys
+"$gw" install-server --repo /srv/git/project.git \
+  --trusted-keys /srv/ksp/trusted-keys \
+  --require-check semantic-scan --require-check secret-scan
+```
+
+After that, `git commit` runs the gateway automatically. Other commands:
+
+- `ksp-gateway check` runs the checks on the staged tree without signing.
+- `ksp-gateway scan [--diff FILE|-]` scans a diff (default: staged changes).
+- `ksp-gateway reattest` re-checks and re-signs `HEAD` after `git commit --amend`,
+  a rebase (`git rebase --exec "ksp-gateway reattest"`), or a cherry-pick, which
+  do not run the commit hooks and therefore change the attested parents.
+- `ksp-gateway verify-commit --trusted-keys FILE [REV...]` verifies locally.
+- `ksp-gateway bench` measures pre-commit latency on the staged change.
+- `ksp-gateway policy` prints the active policy digest and check list.
+
+### Local policy
+
+The policy lives at `.git/ksp/policy.toml`, inside the Git directory, so a
+cloned repository cannot change which checks run on it. `ksp-gateway policy
+--default` prints a commented template. Command checks run in the kernel
+sandbox against a staged-index snapshot (unstaged edits and untracked files are
+absent), with `PATH=/usr/bin:/bin`, an empty environment, no network unless
+`network = "unix"` or `"all"`, and read-only access to any `read_paths`:
+
+```toml
+version = 1
+[scanner]
+exclude_paths = ["tests/fixtures/"]
+
+[[check]]
+name = "unit-tests"
+command = ["/usr/bin/make", "test"]
+timeout_secs = 300
+```
+
+The SHA-256 of the policy file is signed into each attestation. A server can
+restrict accepted policies with `--allow-policy DIGEST` and require named checks
+with `--require-check NAME`.
+
+### Measured latency
+
+Release build, WSL2 Linux 6.18, Intel i5-1135G7 (8 threads), `ksp-gateway
+bench` on 2026-10-27. Times include the Git calls that compute the staged tree
+and diff.
+
+| Staged change | Checks | Median | p95 |
+|---|---|---|---|
+| 1 file, 1 line | built-in scanners | 10.2 ms | 11.6 ms |
+| 290 KB, 7,849 lines | built-in scanners | 33.7 ms | 40.7 ms |
+| 1 file, 1 line | scanners + one sandboxed `/bin/true` | 54.4 ms | 61.0 ms |
+
+Sandboxed checks add snapshot creation (which grows with repository size) plus
+the run time of the checked command itself.
+
+## Orchestrator and snapshots
 
 The `feature/orchestrator` branch adds an asynchronous check scheduler and an
 in-process reader/writer lock manager rooted at a canonical repository
@@ -121,10 +198,18 @@ workspace. By default the CLI denies socket syscalls and uses the compatibility
 seccomp denylist. Run `cargo run --locked -- --help` to see options for
 additional read-only paths, socket domains, and target-specific syscall
 allowlists. Running `cargo run --locked` without a subcommand only prints the
-current orchestrator readiness message; the CLI does not install a Git hook.
+current orchestrator readiness message; hooks are installed only by
+`ksp-gateway install`.
 
-Run the full suite, including real child-process sandbox checks, with:
+Run the full suite, including real child-process sandbox checks and the
+end-to-end commit/push flows, with:
 
 ```sh
 cargo test --locked -- --test-threads=1
 ```
+
+| Suite | Covers |
+|---|---|
+| `src/*` unit tests (70) | Git helpers, attestation encoding/signing/trust, bouncer decisions, scanner detections and false positives, policy parsing, staged snapshots, pipeline and hook installation |
+| `tests/sandbox_enforcement.rs` (11) | Real Landlock/seccomp enforcement in child processes |
+| `tests/end_to_end.rs` (6) | Real `git commit`/`git push` through installed hooks and a bare server with `pre-receive` |

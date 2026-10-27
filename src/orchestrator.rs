@@ -59,6 +59,17 @@ impl FileAccess {
     }
 }
 
+/// Which file contents a check's disposable snapshot starts from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SnapshotSource {
+    /// Current working-tree bytes of tracked and non-ignored untracked files.
+    #[default]
+    WorkingTree,
+    /// Exactly the staged index contents, as the next commit would record
+    /// them. Unstaged edits and untracked files are not present.
+    StagedIndex,
+}
+
 /// One named asynchronous check and the paths it may access.
 ///
 /// The action receives a [`CheckContext`] for a disposable workspace. Any file
@@ -68,6 +79,8 @@ pub struct CheckTask {
     name: String,
     accesses: Vec<FileAccess>,
     timeout: Option<Duration>,
+    snapshot_source: SnapshotSource,
+    index_file: Option<PathBuf>,
     cancellation: CheckCancellation,
     action: CheckAction,
 }
@@ -84,6 +97,8 @@ impl CheckTask {
             name: name.into(),
             accesses,
             timeout: None,
+            snapshot_source: SnapshotSource::WorkingTree,
+            index_file: None,
             cancellation: CheckCancellation::default(),
             action: Box::new(move |context| Box::pin(action(context))),
         }
@@ -92,6 +107,19 @@ impl CheckTask {
     /// Set an optional wall-clock limit, including time waiting for file locks.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
+        self
+    }
+
+    /// Choose whether the snapshot reflects the working tree or the index.
+    pub fn with_snapshot_source(mut self, source: SnapshotSource) -> Self {
+        self.snapshot_source = source;
+        self
+    }
+
+    /// Read staged entries from this index file instead of the repository's
+    /// default index, as Git hooks must when `GIT_INDEX_FILE` is set.
+    pub fn with_index_file(mut self, index_file: impl Into<PathBuf>) -> Self {
+        self.index_file = Some(index_file.into());
         self
     }
 
@@ -427,12 +455,14 @@ async fn execute_check(
     }
 
     let root = manager.root.clone();
-    let workspace = tokio::task::spawn_blocking(move || IsolatedWorkspace::create(&root))
-        .await
-        .map_err(|error| CheckFailure::Failed(format!("snapshot task failed: {error}")))?
-        .map_err(|error| {
-            CheckFailure::Failed(format!("could not create check snapshot: {error}"))
-        })?;
+    let source = check.snapshot_source;
+    let index_file = check.index_file;
+    let workspace = tokio::task::spawn_blocking(move || {
+        IsolatedWorkspace::create_with_index(&root, source, index_file.as_deref())
+    })
+    .await
+    .map_err(|error| CheckFailure::Failed(format!("snapshot task failed: {error}")))?
+    .map_err(|error| CheckFailure::Failed(format!("could not create check snapshot: {error}")))?;
     let context = CheckContext {
         repository_root: manager.root.clone(),
         workspace_root: workspace.path().to_path_buf(),
@@ -466,7 +496,41 @@ pub struct IsolatedWorkspace {
 impl IsolatedWorkspace {
     /// Copy the current working-tree view into a private temporary directory.
     pub fn create(repository_root: impl AsRef<Path>) -> io::Result<Self> {
+        Self::create_from(repository_root, SnapshotSource::WorkingTree)
+    }
+
+    /// Create a snapshot from the working tree or from the staged index.
+    pub fn create_from(
+        repository_root: impl AsRef<Path>,
+        source: SnapshotSource,
+    ) -> io::Result<Self> {
+        Self::create_with_index(repository_root, source, None)
+    }
+
+    /// Like [`Self::create_from`], reading staged entries from `index_file`
+    /// when given (relative paths are resolved against the repository root).
+    pub fn create_with_index(
+        repository_root: impl AsRef<Path>,
+        source: SnapshotSource,
+        index_file: Option<&Path>,
+    ) -> io::Result<Self> {
         let repository_root = fs::canonicalize(repository_root)?;
+        let index_file = index_file.map(|path| repository_root.join(path));
+        let index_output = |args: &[&str]| -> io::Result<std::process::Output> {
+            let mut command = git_command(&repository_root);
+            if let Some(index) = &index_file {
+                command.env("GIT_INDEX_FILE", index);
+            }
+            let output = command.args(args).output()?;
+            if output.status.success() {
+                Ok(output)
+            } else {
+                Err(io::Error::other(format!(
+                    "git command failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )))
+            }
+        };
         let (git_root, paths) = git_working_paths(&repository_root)?;
         if git_root != repository_root {
             return Err(io::Error::new(
@@ -477,12 +541,9 @@ impl IsolatedWorkspace {
 
         let mut workspace = Self::create_temp_dir()?;
         workspace.repository_root = repository_root.clone();
-        let entries = git_output(
-            &repository_root,
-            ["ls-files", "--stage", "--full-name", "-z"],
-        )?;
+        let entries = index_output(&["ls-files", "--stage", "--full-name", "-z"])?;
         validate_index_entries(&entries.stdout)?;
-        let flags = git_output(&repository_root, ["ls-files", "-v", "--full-name", "-z"])?;
+        let flags = index_output(&["ls-files", "-v", "--full-name", "-z"])?;
         for entry in flags
             .stdout
             .split(|byte| *byte == 0)
@@ -563,6 +624,15 @@ impl IsolatedWorkspace {
         let status = child.wait()?;
         if !status.success() {
             return Err(io::Error::other("could not reconstruct isolated Git index"));
+        }
+        if source == SnapshotSource::StagedIndex {
+            // The private index already holds the staged entries; write them
+            // out with the snapshot's own configuration (no filters or hooks).
+            let mut checkout = git_command(&workspace.path);
+            checkout.args(["checkout-index", "--all", "--force"]);
+            run_git(checkout)?;
+            workspace.baseline = Some(create_snapshot_baseline(&workspace.path)?);
+            return Ok(workspace);
         }
         for relative in paths {
             if !is_safe_relative_path(&relative) || relative.components().any(is_git_metadata) {
@@ -1516,6 +1586,87 @@ mod tests {
         );
         let staged = git_output(&root, ["diff", "--cached", "--", "file.txt"]).unwrap();
         assert!(String::from_utf8_lossy(&staged.stdout).contains("staged version"));
+    }
+
+    #[tokio::test]
+    async fn staged_snapshots_contain_exactly_the_index_contents() {
+        let repository = IsolatedWorkspace::create_temp_dir().unwrap();
+        let root = repository.path().to_path_buf();
+        git_output(&root, ["init", "-q"]).unwrap();
+        git_output(&root, ["config", "user.name", "KSP test"]).unwrap();
+        git_output(&root, ["config", "user.email", "ksp-test@example.invalid"]).unwrap();
+        fs::write(root.join("file.txt"), "base\n").unwrap();
+        fs::write(root.join("deleted.txt"), "still staged\n").unwrap();
+        git_output(&root, ["add", "file.txt", "deleted.txt"]).unwrap();
+        git_output(&root, ["commit", "-qm", "initial"]).unwrap();
+        fs::write(root.join("file.txt"), "staged version\n").unwrap();
+        git_output(&root, ["add", "file.txt"]).unwrap();
+        fs::write(root.join("file.txt"), "unstaged version\n").unwrap();
+        fs::remove_file(root.join("deleted.txt")).unwrap();
+        fs::write(root.join("untracked.txt"), "not part of the commit\n").unwrap();
+
+        let manager = Arc::new(FileLockManager::new(&root).unwrap());
+        let check = CheckTask::new(
+            "inspect-staged",
+            vec![FileAccess::read(".")],
+            |context| async move {
+                let read = |name: &str| fs::read_to_string(context.workspace_root().join(name));
+                assert_eq!(read("file.txt").unwrap(), "staged version\n");
+                assert_eq!(read("deleted.txt").unwrap(), "still staged\n");
+                assert!(read("untracked.txt").is_err());
+                let status =
+                    git_output(context.workspace_root(), ["status", "--porcelain"]).unwrap();
+                assert_eq!(
+                    String::from_utf8_lossy(&status.stdout),
+                    "M  file.txt\n",
+                    "only the staged change should be visible"
+                );
+                Ok(())
+            },
+        )
+        .with_snapshot_source(SnapshotSource::StagedIndex);
+        let results = run_checks(manager, vec![check]).await;
+        assert_eq!(results[0].status, CheckStatus::Passed);
+        assert_eq!(results[0].reconciliation, ReconciliationStatus::NoChanges);
+        assert_eq!(
+            fs::read_to_string(root.join("file.txt")).unwrap(),
+            "unstaged version\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn staged_snapshots_can_read_an_alternate_index_file() {
+        let repository = IsolatedWorkspace::create_temp_dir().unwrap();
+        let root = repository.path().to_path_buf();
+        git_output(&root, ["init", "-q"]).unwrap();
+        fs::write(root.join("file.txt"), "main index\n").unwrap();
+        git_output(&root, ["add", "file.txt"]).unwrap();
+        // Git hooks for `git commit -a` receive a temporary index like this one.
+        let alternate = root.join(".git/next-index.lock");
+        fs::copy(root.join(".git/index"), &alternate).unwrap();
+        fs::write(root.join("file.txt"), "alternate index\n").unwrap();
+        let mut add = git_command(&root);
+        add.env("GIT_INDEX_FILE", &alternate)
+            .args(["add", "file.txt"]);
+        run_git(add).unwrap();
+
+        let check = CheckTask::new(
+            "inspect-alternate",
+            vec![FileAccess::read(".")],
+            |context| async move {
+                let contents = fs::read_to_string(context.workspace_root().join("file.txt"))
+                    .map_err(|error| error.to_string())?;
+                if contents == "alternate index\n" {
+                    Ok(())
+                } else {
+                    Err(format!("snapshot used the wrong index: {contents:?}"))
+                }
+            },
+        )
+        .with_snapshot_source(SnapshotSource::StagedIndex)
+        .with_index_file(&alternate);
+        let results = run_checks(Arc::new(FileLockManager::new(&root).unwrap()), vec![check]).await;
+        assert_eq!(results[0].status, CheckStatus::Passed);
     }
 
     #[test]

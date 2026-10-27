@@ -1,7 +1,9 @@
 pub mod attestation;
 pub mod bouncer;
+pub mod gateway;
 pub mod git;
 pub mod orchestrator;
+pub mod policy;
 #[cfg(target_os = "linux")]
 pub mod sandbox;
 pub mod scanner;

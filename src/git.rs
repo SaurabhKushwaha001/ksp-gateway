@@ -37,12 +37,60 @@ pub struct CommitInfo {
 #[derive(Debug, Clone)]
 pub struct Repository {
     root: PathBuf,
+    index_file: Option<PathBuf>,
+    keep_object_environment: bool,
 }
 
 impl Repository {
     pub fn new(root: impl AsRef<Path>) -> Self {
         Self {
             root: root.as_ref().to_path_buf(),
+            index_file: None,
+            keep_object_environment: false,
+        }
+    }
+
+    /// A repository opened from inside a server `pre-receive` hook. Git places
+    /// pushed objects in a quarantine directory named by `GIT_OBJECT_DIRECTORY`
+    /// and `GIT_ALTERNATE_OBJECT_DIRECTORIES`; those variables are kept so the
+    /// incoming commits can be read.
+    pub fn for_receive_hook(root: impl AsRef<Path>) -> Self {
+        Self {
+            keep_object_environment: true,
+            ..Self::new(root)
+        }
+    }
+
+    /// Use an alternate index, as Git hooks must when `GIT_INDEX_FILE` is set.
+    /// Relative paths are resolved against the repository root.
+    pub fn with_index_file(mut self, index_file: Option<PathBuf>) -> Self {
+        self.index_file = index_file.map(|path| self.root.join(path));
+        self
+    }
+
+    pub fn index_file(&self) -> Option<&Path> {
+        self.index_file.as_deref()
+    }
+
+    /// Read a configuration value exactly as Git would for normal commands,
+    /// without this module's safety overrides.
+    pub fn config_value(&self, key: &str) -> io::Result<Option<String>> {
+        let output = Command::new("git")
+            .current_dir(&self.root)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .args(["config", "--get", key])
+            .stdin(Stdio::null())
+            .output()?;
+        match output.status.code() {
+            Some(0) => Ok(Some(
+                String::from_utf8_lossy(&output.stdout).trim().to_string(),
+            )),
+            Some(1) => Ok(None),
+            _ => Err(io::Error::other(format!(
+                "git config failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))),
         }
     }
 
@@ -59,9 +107,18 @@ impl Repository {
             .env_remove("GIT_INDEX_FILE")
             .env_remove("GIT_COMMON_DIR")
             .env_remove("GIT_PREFIX")
-            .env_remove("GIT_OBJECT_DIRECTORY")
             .env_remove("GIT_EXTERNAL_DIFF")
-            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_TERMINAL_PROMPT", "0");
+        if let Some(index) = &self.index_file {
+            command.env("GIT_INDEX_FILE", index);
+        }
+        if !self.keep_object_environment {
+            command
+                .env_remove("GIT_OBJECT_DIRECTORY")
+                .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+                .env_remove("GIT_QUARANTINE_PATH");
+        }
+        command
             .args([
                 "-c",
                 "core.fsmonitor=false",

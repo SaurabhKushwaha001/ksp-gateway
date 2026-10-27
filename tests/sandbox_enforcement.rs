@@ -380,6 +380,34 @@ async fn sandboxed_git_can_read_snapshot_objects_without_repository_access() {
     assert!(status.success(), "git status exited with {status}");
 }
 
+/// Hosted CI images ship `/etc/gitconfig`, which Landlock denies. Git treats an
+/// unreadable system config as fatal, so sandboxed Git must skip it.
+#[tokio::test]
+async fn sandboxed_git_ignores_an_unreadable_system_config() {
+    let snapshot = IsolatedWorkspace::create(env!("CARGO_MANIFEST_DIR"))
+        .expect("create isolated Git snapshot");
+    let mut policy = SandboxPolicy::workspace_only(snapshot.path());
+    policy.paths.push(PathRule {
+        path: snapshot.git_objects_path().to_path_buf(),
+        access: PathAccess::ReadOnly,
+    });
+
+    // `/etc/hostname` exists but is outside the Landlock grants, like
+    // `/etc/gitconfig` on GitHub-hosted runners.
+    let status = SandboxCommand::new(policy, "/usr/bin/env")
+        .args([
+            "GIT_CONFIG_SYSTEM=/etc/hostname",
+            "git",
+            "status",
+            "--short",
+        ])
+        .helper_executable(env!("CARGO_BIN_EXE_ksp-gateway"))
+        .status()
+        .await
+        .expect("launch sandboxed Git");
+    assert!(status.success(), "git status exited with {status}");
+}
+
 #[tokio::test]
 async fn orchestrator_can_run_a_git_check_through_the_sandbox() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

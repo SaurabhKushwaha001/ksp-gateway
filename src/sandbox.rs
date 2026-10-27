@@ -584,7 +584,10 @@ fn child_entry_inner(args: impl IntoIterator<Item = OsString>) -> Result<(), San
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", "/nonexistent")
-        .env("LANG", "C");
+        .env("LANG", "C")
+        // Landlock denies the host's /etc/gitconfig, and Git treats an
+        // unreadable system config as fatal; sandboxed Git must not use it.
+        .env("GIT_CONFIG_NOSYSTEM", "1");
     let error = command.exec();
     Err(SandboxError::Io(error))
 }

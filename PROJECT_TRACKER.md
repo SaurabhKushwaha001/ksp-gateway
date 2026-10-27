@@ -14,9 +14,10 @@ developer, platform, or coding session can resume without relying on chat histor
 - **Working directory:** `/home/saurabhubuntu/ksp-gateway` (WSL2 / Ubuntu).
 - **Language/runtime:** Stable Rust, edition 2024; Tokio for async orchestration.
 - **Current toolchain observed:** `rustc 1.98.0`, `cargo 1.98.0`.
-- **Current branch:** `feature/orchestrator`, created from `develop`.
-- **Current Git status at tracker creation:** implementation changes are
-  uncommitted on the feature branch; no branch integration has happened.
+- **Current branch:** `feature/kernel-sandbox`, created from updated `develop`
+  at `0bfb2e5` (orchestrator merge).
+- **Current Git status:** kernel sandbox implementation and tests are under
+  development on this feature branch; changes remain local and uncommitted.
 
 ## Why this project exists
 
@@ -133,9 +134,9 @@ index and isolated hooks path. Source Git objects are borrowed read-only.
 Ignored files are excluded; submodules are rejected. Returned patches contain
 only check-generated changes. `apply_changes` takes an exclusive gateway lock,
 rechecks the patch, applies it to the working tree, and leaves the Git index
-untouched. This cannot coordinate external editors or Git processes. Do not
-start the sandbox phase until the orchestrator behavior needed by the next
-layer is implemented and reviewed.
+untouched. This cannot coordinate external editors or Git processes. The
+orchestrator feature was merged into the updated `develop` before the sandbox
+branch was created; its limitations remain relevant to later integration.
 
 **Feature 1 progress estimate:** approximately 95% complete. The async scheduler,
 path coordination, cancellation, containment checks, disposable Git snapshots,
@@ -158,24 +159,95 @@ rechecks immediately before Git's worktree-only patch application. This protects
 against concurrent gateway tasks, not external processes; it does not promise
 filesystem-wide atomicity on an I/O failure.
 
-### 2. Kernel sandbox — after orchestrator
+### 2. Kernel sandbox — current priority
 
-- [ ] Establish a sandbox policy/config model (read/write paths, denied paths,
-      network/socket policy, and required syscalls).
-- [ ] Detect Linux and required kernel features/ABIs before launch.
-- [ ] Apply `PR_SET_NO_NEW_PRIVS` before installing restrictions.
-- [ ] Apply Landlock path rules after no-new-privileges.
-- [ ] Apply seccomp-bpf rules after Landlock.
-- [ ] Keep the order **no-new-privileges → Landlock → seccomp** explicit and
+- [x] Establish an initial sandbox policy model for workspace-contained
+      read-only/read-write paths; network access defaults to denied in policy.
+- [x] Validate configured paths exist, canonicalize, and remain under the
+      workspace root; test valid and out-of-root policy cases.
+- [x] Pin Linux dependencies to `landlock` 0.4.7 and `seccompiler` 0.5.0.
+- [x] Add Landlock ruleset-creation preflight using the public crate API and
+      hard compatibility requirements for ABI V6. This reports capability only;
+      the child still verifies full enforcement at launch.
+- [x] Report whether seccompiler supports the build target architecture. This
+      does not prove that the kernel will accept a filter at runtime.
+- [x] Deny path access outside explicit grants; reject workspace/policy grants
+      that overlap the effective user's `~/.ssh` or `~/.aws` paths.
+- [x] Reject contradictory nested policy rules where a writable parent would
+      make a declared read-only child writable under Landlock's additive rules.
+- [x] Detect required Linux features/ABI V6 and seccomp architecture support;
+      launch fails closed if full Landlock enforcement is unavailable.
+- [x] Allow explicitly selected external read-only paths for trusted runtime
+      inputs such as the original Git object database; writable paths must stay
+      inside the disposable workspace.
+- [x] Implement a dedicated helper mode that starts before Tokio, closes
+      ambient file descriptors, changes directory through an opened workspace
+      descriptor, then execs the requested command.
+- [x] Add a `sandbox` CLI command to launch commands under a workspace policy
+      and a `capabilities` command for host preflight information.
+- [x] Apply `PR_SET_NO_NEW_PRIVS` before installing restrictions.
+- [x] Apply Landlock path rules after no-new-privileges, using opened path
+      descriptors and requiring `FullyEnforced` status.
+- [x] Apply seccomp-bpf after Landlock. Compatibility mode denies selected
+      high-risk calls; opt-in syscall allowlists deny unlisted syscall numbers
+      and require `execve` so the helper can launch the command.
+- [x] Keep the order **no-new-privileges → Landlock → seccomp** explicit and
       covered by tests/review; do not reorder these setup steps.
-- [ ] Restrict access to sensitive locations such as `~/.ssh` and `~/.aws`,
-      and control unauthorized sockets according to the threat model.
-- [ ] Launch untrusted hooks/checks only after all required rules are active.
-- [ ] Fail closed when a required security control cannot be installed; report
-      unsupported kernels/policies distinctly from a successful sandbox run.
-- [ ] Add positive and negative integration tests in disposable environments.
-- [ ] Document that the guarantee depends on the kernel, configured policy,
-      and successful rule installation.
+- [x] Keep untrusted commands from starting until all required rules are active;
+      clear their inherited environment and close non-standard file descriptors.
+- [x] Fail closed when a required security control cannot be installed and
+      print the setup failure to stderr with helper exit code 125.
+- [x] Add disposable integration tests for workspace read/write, denied host
+      file access, denied socket creation, unaffected parent access, and child
+      termination when the async launch is cancelled; verify a workspace
+      symlink cannot expose a host file outside the Landlock boundary, and
+      verify explicit socket domains, syscall allowlists, and changed-path
+      identities enforce the configured policy.
+- [x] Add `CheckTask::sandboxed_command` so Linux orchestration checks run in
+      the helper, receive the disposable snapshot, and can read its source Git
+      objects through an explicit read-only Landlock rule.
+- [x] Configure explicit syscall allowlists and socket-domain policies; check
+      inherited standard descriptors for sockets when socket access is
+      restricted and provide stdin/stdout/stderr configuration.
+- [x] Test that policy grants for `.aws` and `.ssh` are rejected, including
+      `.ssh` when it is a symlink to credential storage.
+- [x] Verify an opened read-only path descriptor still identifies the original
+      directory after its pathname is renamed and replaced.
+- [x] Exercise deterministic replacement between gateway resolution and helper
+      opening; the helper checks device/inode identity and exits 125 on change.
+- [x] Add GitHub Actions coverage for x86_64 and arm64 on Ubuntu 24.04 and
+      26.04; each job runs format, tests, and Clippy.
+- [ ] Confirm successful hosted-runner results and record the kernels used.
+- [x] Document the kernel, configured-policy, and successful-rule-installation
+      dependencies, plus current syscall, network, and race-test limitations.
+
+**Current sandbox implementation:** `src/main.rs` exposes `sandbox` and
+`capabilities` commands. `src/sandbox.rs` launches a dedicated helper process,
+applies no-new-privileges → Landlock ABI V6 → seccomp, verifies Landlock reports
+full enforcement, then execs the requested command with a sanitized
+environment. `CheckTask::sandboxed_command` runs shell/tool checks through this
+path against the disposable snapshot. Integration tests on WSL2
+Linux 6.18 confirm workspace read/write, denial of `/etc/passwd` and socket
+creation, AF_UNIX-only socket creation, rejection of an unlisted syscall under
+an explicit allowlist, Git access through the explicitly granted read-only
+source object store, unchanged parent-process access, and process-group
+cleanup after cancellation. A delayed-helper test replaces a grant after the
+gateway opens it and verifies that a device/inode mismatch fails closed.
+Landlock enforces handled filesystem rights for granted paths. The default
+seccomp compatibility mode remains a targeted denylist; a strict,
+architecture-specific allowlist is opt-in and has no curated shell, Python, or
+Git profiles. Socket-domain rules govern socket creation, not destination
+addresses. Approved runtime paths (`/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`,
+dynamic-loader cache, and `/dev/null`) are available with limited permissions.
+Cross-kernel and cross-architecture integration remains unverified. Do not
+describe this as complete containment for arbitrary hostile native code.
+
+**Progress estimate: about 95%.** The enforcement path, configurable policy,
+CLI, orchestrator integration, tests, and security documentation are
+implemented. Remaining work is compatibility verification on additional Linux
+kernels and architectures through the new CI matrix. The workflow has not run
+yet, so cross-architecture compatibility is not confirmed.
+This estimate tracks the Kernel Sandbox feature only.
 
 ### 3. Attestation and server bouncer — after sandbox
 
@@ -270,6 +342,14 @@ filesystem-wide atomicity on an I/O failure.
   cleanup; the lock guard uses that rule to release access when it leaves
   scope. `async` functions can suspend while waiting; Tokio runs those futures
   so unrelated tasks can make progress.
+- **Sandbox process boundary:** The current Tokio runtime is not the place to
+  install per-thread Landlock/seccomp restrictions. A dedicated child starts
+  before Tokio, installs no-new-privileges, then Landlock, then seccomp, and
+  only then execs untrusted code. Its Landlock path descriptors are opened
+  first and held by owned `PathFd` values; dropping those values closes the
+  descriptors. The async launcher uses Tokio's child-process handle with
+  kill-on-drop, so cancelling the launch stops the helper/command process.
+  Preflight observations are not enforcement guarantees.
 
 ## Current verification and handoff
 
@@ -295,11 +375,36 @@ filesystem-wide atomicity on an I/O failure.
 - `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
   `cargo test` (7 tests), and `git diff --check` — passed after the latest
   scheduler changes (2026-10-03).
-- `git diff --check` — passed after the first implementation slice.
-- Current code/doc changes are uncommitted on `feature/orchestrator`.
-- Next task: run the final validation, commit the orchestrator feature on
-  `feature/orchestrator`, then push it. Remaining limitations are listed above;
-  do not present these as kernel sandbox guarantees.
+- `cargo fmt`, `cargo test` (29 tests: 24 unit, 5 sandbox integration),
+  `cargo clippy --all-targets -- -D warnings`, and `git diff --check` — passed
+  after adding Landlock workspace-symlink and credential-path regression tests
+  to Linux child enforcement and orchestrator command checks on WSL2 kernel
+  6.18 (2026-10-23).
+- `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test` (30 tests: 25 unit, 5 sandbox integration), and
+  `git diff --check` — passed after verifying that a retained read-only
+  `PathFd` remains attached to its original directory when its pathname is
+  replaced (WSL2 Linux 6.18, 2026-10-24).
+- `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test` (31 tests: 25 unit, 6 sandbox integration), and
+  `git diff --check` — passed after documenting sandbox guarantees/limits and
+  verifying that `allow_network` permits socket creation (WSL2 Linux 6.18,
+  2026-10-24).
+- `cargo fmt --check`, `cargo test --locked -- --test-threads=1` (37 tests: 27
+  unit, 10 sandbox integration), `cargo clippy --all-targets -- -D warnings`,
+  and `git diff --check` — passed after adding explicit syscall allowlists,
+  socket-domain filtering, standard-stream configuration, deterministic
+  path-replacement rejection, and Linux CI matrix setup (WSL2 Linux 6.18,
+  2026-10-26).
+- `cargo fmt --check`, `cargo test --locked -- --test-threads=1` (38 tests: 27
+  unit, 11 sandbox integration), `cargo clippy --locked --all-targets -- -D
+  warnings`, and `git diff --check` — passed after adding and exercising the
+  local `sandbox` and `capabilities` CLI commands (WSL2 Linux 6.18, 2026-10-26).
+- Increased two scheduler test timeouts from 1s to 5s after full-suite runs on
+  WSL2 intermittently exceeded the original limits during snapshot creation.
+- Current sandbox code/doc changes are uncommitted on `feature/kernel-sandbox`.
+- Next task: confirm the Linux CI matrix passes on x86_64/arm64 and both Ubuntu
+  versions before claiming broader compatibility.
 
 ## How to resume
 

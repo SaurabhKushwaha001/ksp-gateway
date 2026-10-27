@@ -1,0 +1,41 @@
+name: Linux sandbox
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify on ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            arch: x86_64
+          - os: ubuntu-24.04-arm
+            arch: aarch64
+          - os: ubuntu-26.04
+            arch: x86_64
+          - os: ubuntu-26.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Report runner kernel
+        run: uname -a
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Run tests
+        run: cargo test --locked -- --test-threads=1
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings

@@ -1,0 +1,475 @@
+# KSP Gateway Project Tracker
+
+This file is the durable handoff for the project. Update it whenever a feature,
+decision, test result, or implementation status changes. It is written so a new
+developer, platform, or coding session can resume without relying on chat history.
+
+## Project identity
+
+- **Project:** KSP-Gateway, a zero-trust pre-commit security gateway for
+  AI-assisted software engineering.
+- **Academic context:** Final-year B.Tech CSE project, IKGPTU; submitted to
+  Mr. Sachin.
+- **Team:** Saurabh Kushwaha, Aditya Chandel, Karan Paul.
+- **Working directory:** `/home/saurabhubuntu/ksp-gateway` (WSL2 / Ubuntu).
+- **Language/runtime:** Stable Rust, edition 2024; Tokio for async orchestration.
+- **Current toolchain observed:** `rustc 1.98.0`, `cargo 1.98.0`.
+- **Current branch:** `feature/integration`, stacked on
+  `feature/semantic-firewall` → `feature/attestation` → `feature/kernel-sandbox`
+  (`7e0f7ec`). `develop` is still at `0bfb2e5` (orchestrator merge).
+- **Current Git status:** each phase is committed locally on its own stacked
+  branch; nothing has been pushed. Team review decides how they reach `develop`.
+
+## Why this project exists
+
+AI coding agents can run shell commands and modify files with the developer's
+local privileges. A hostile repository can exploit routine Git activity if
+hooks or other repository-controlled scripts run without sufficient isolation.
+KSP Gateway is intended to put local checks and kernel restrictions around the
+pre-commit workflow, then let a server-side verifier reject commits that lack
+valid local attestation.
+
+The project description references CVE-2026-26268 as motivating context. Verify
+the exact CVE details from primary sources before repeating them in public
+documentation or the demo; this tracker does not independently validate that
+claim.
+
+## Architecture and security claims
+
+| Layer | Planned implementation | Security role and limits |
+|---|---|---|
+| Orchestrator (spine) | Rust + Tokio; task/check coordination; per-path shared/exclusive access; safe working-tree change handling | Coordinates gateway tasks. A userspace lock alone cannot stop unrelated processes from changing files. |
+| Kernel sandbox | Linux Landlock + seccomp-bpf; `landlock` and `seccompiler` crates | Intended OS-enforced restriction of filesystem and syscall access. Must fail closed when required setup cannot be applied. Required setup order: no-new-privileges, Landlock, then seccomp. |
+| Attestation + server bouncer | `ed25519-dalek`; local signing after passing checks; server-side Git `pre-receive` verifier | Server-side enforcement can reject pushes without a valid signature. Local checks alone are bypassable (for example, `git commit --no-verify`). Key provisioning, revocation, and trust policy remain design tasks. |
+| AI semantic firewall | Offline ONNX Runtime sidecar using `ort`, intended to inspect Git diffs for agent-targeting instructions | Best-effort heuristic defense-in-depth only. It cannot guarantee detection or replace the kernel sandbox. |
+
+**Do not overstate security:** distinguish OS-enforced controls, server-enforced
+signature policy, in-process coordination, and heuristic scanning in code,
+documentation, and presentations.
+
+## Feature inventory and status
+
+Status meanings: **Done** means implemented and checked; **In progress** means a
+partial implementation exists; **Planned** means not implemented; **Research**
+means the design or feasibility still needs validation.
+
+### 0. Setup and research
+
+- [x] Minimal Rust project skeleton exists.
+- [x] Verify Rust/Cargo availability on the current WSL environment.
+- [x] Add CI for formatting, linting, and tests (`.github/workflows/linux-sandbox.yml`).
+- [ ] Record supported Linux kernel/distribution requirements and crate versions.
+- [ ] Research Landlock ABI availability and seccomp behavior on supported WSL2
+      kernels; document any WSL-specific limitations.
+- [ ] Compile a primary-source reading list for the threat model and referenced
+      vulnerability.
+
+### 1. Orchestrator — current priority
+
+- [x] Add Tokio runtime dependency and async binary entry point.
+- [x] Add `FileLockManager` with shared and exclusive per-path locks.
+- [x] Normalize absolute/relative paths under a canonical repository root; reject
+      parent-directory components and paths that resolve outside the root.
+- [x] Test concurrent shared access, writer exclusion, and independence of
+      unrelated paths (3 tests passing on 2026-10-03).
+- [x] Add a named async check/task model with declared read/write paths,
+      success/failure/timeout results, and elapsed-time reporting.
+- [x] Run independent checks concurrently and serialize overlapping path access
+      (a directory conflicts with descendants); collapse overlapping declarations
+      within one check and serialize lock state through a short registry mutex.
+- [x] Apply per-check timeout to total time, including lock wait; timeout drops
+      the in-flight check future and releases any locks already acquired.
+- [x] Preserve submission order in returned check results.
+- [x] Test independent concurrency, conflicting serialization, timeout lock
+      release, reverse path declaration order, and action errors/panics (7 tests
+      pass after this scheduler slice).
+- [x] Test repository-root containment, symlink aliases/escapes, parent-child
+      conflicts, per-check cancellation and lock release, and nested declarations
+      in one check (12 tests currently pass).
+- [x] Add a cloneable per-check cancellation handle and a `Cancelled` result;
+      cancellation drops the check future and releases its gateway locks.
+- [x] Resolve existing symlink ancestors, unify symlink aliases, and reject
+      declared paths that escape the configured repository root.
+- [x] Reject Unix hard-linked files from declared path locking, since distinct
+      pathnames can identify the same inode. Other platform hard-link identity
+      is not available through the current portable implementation.
+- [ ] Define path identity on case-insensitive filesystems. Canonical paths and
+      in-process locks do not close TOCTOU races against external processes.
+- [x] Snapshot working-tree state before a check that may write.
+- [x] Give each check a private temporary snapshot of tracked and non-ignored
+      untracked working-tree files; omit `.git` and ignored files. Test that a
+      check can write its snapshot without changing the source working tree.
+- [x] Preserve worktree deletions in the candidate view and verify that
+      non-ignored untracked files are included while ignored files are omitted.
+- [x] Give snapshots private Git metadata and reconstruct the ordinary staged
+      index so Git-aware checks can inspect staged and unstaged diffs. Snapshot
+      hooks are redirected to a private empty directory; source Git objects are
+      referenced read-only through Git alternates.
+- [x] Return each successful check's candidate changes as a binary Git diff in
+      `CheckResult`, relative to a captured snapshot baseline.
+- [x] Preflight each patch against the live worktree and report `NoChanges`,
+      `Applicable`, or `Conflict` in `CheckResult`; do not write to the live tree.
+- [x] Add `FileLockManager::apply_changes`: take an exclusive repository lock,
+      recheck against current files, apply only to the worktree, and leave the
+      Git index untouched. Conflicts return an error.
+- [x] Fail closed on assume-unchanged, skip-worktree, intent-to-add, and
+      unmerged index entries because their semantics are not reconstructed.
+- [x] Define snapshot policy: ignored files are excluded and submodules fail
+      closed until their semantics are designed.
+- [x] Test stale patch rejection, successful application, staged-index
+      preservation, undeclared writes, and Unix hard-link rejection.
+- [x] Keep reporting limited to check status, elapsed time, and returned diff;
+      this module does not log source file contents.
+- [x] Lock registry entries are removed when guards drop; no idle path entry is
+      retained.
+
+**Current module:** `src/orchestrator.rs`. The scheduler trusts checks to declare
+all paths they access. The manager canonicalizes its root and locks overlapping
+path prefixes, including a directory and its descendants. These locks are
+in-process only; they do not lock files against editors or other processes,
+cannot stop undeclared access, do not guarantee fair waiter scheduling, and do
+not protect the filesystem from symlink replacement races. `FileLockManager`
+accepts any existing directory; the caller must currently supply the intended
+repository root. Each check receives a temporary Git snapshot with a private
+index and isolated hooks path. Source Git objects are borrowed read-only.
+Ignored files are excluded; submodules are rejected. Returned patches contain
+only check-generated changes. `apply_changes` takes an exclusive gateway lock,
+rechecks the patch, applies it to the working tree, and leaves the Git index
+untouched. This cannot coordinate external editors or Git processes. The
+orchestrator feature was merged into the updated `develop` before the sandbox
+branch was created; its limitations remain relevant to later integration.
+
+**Feature 1 progress estimate:** approximately 95% complete. The async scheduler,
+path coordination, cancellation, containment checks, disposable Git snapshots,
+baseline-relative patches, stale-patch rejection, and guarded worktree apply are
+implemented. Remaining limitations are case-insensitive path identity,
+non-Unix hard-link detection, custom filter semantics, and broader platform
+integration coverage. This estimate is a planning aid, not an acceptance or
+security-readiness claim.
+
+**Working-tree safety direction (partially implemented):** each action gets a
+separate temporary Git snapshot with private metadata and index. A separate
+baseline tree records the initial snapshot files, so returned patches include
+only check-generated changes. Source objects are borrowed read-only, and hooks
+are redirected to an empty private directory. The snapshot includes tracked
+and non-ignored untracked files, omits ignored files, rejects external symlinks,
+and fails on submodules. Assume-unchanged, skip-worktree, intent-to-add, and
+unmerged index states fail snapshot creation. Custom filter/config semantics
+are not preserved. Applying a result reacquires the gateway root lock and
+rechecks immediately before Git's worktree-only patch application. This protects
+against concurrent gateway tasks, not external processes; it does not promise
+filesystem-wide atomicity on an I/O failure.
+
+### 2. Kernel sandbox — current priority
+
+- [x] Establish an initial sandbox policy model for workspace-contained
+      read-only/read-write paths; network access defaults to denied in policy.
+- [x] Validate configured paths exist, canonicalize, and remain under the
+      workspace root; test valid and out-of-root policy cases.
+- [x] Pin Linux dependencies to `landlock` 0.4.7 and `seccompiler` 0.5.0.
+- [x] Add Landlock ruleset-creation preflight using the public crate API and
+      hard compatibility requirements for ABI V6. This reports capability only;
+      the child still verifies full enforcement at launch.
+- [x] Report whether seccompiler supports the build target architecture. This
+      does not prove that the kernel will accept a filter at runtime.
+- [x] Deny path access outside explicit grants; reject workspace/policy grants
+      that overlap the effective user's `~/.ssh` or `~/.aws` paths.
+- [x] Reject contradictory nested policy rules where a writable parent would
+      make a declared read-only child writable under Landlock's additive rules.
+- [x] Detect required Linux features/ABI V6 and seccomp architecture support;
+      launch fails closed if full Landlock enforcement is unavailable.
+- [x] Allow explicitly selected external read-only paths for trusted runtime
+      inputs such as the original Git object database; writable paths must stay
+      inside the disposable workspace.
+- [x] Implement a dedicated helper mode that starts before Tokio, closes
+      ambient file descriptors, changes directory through an opened workspace
+      descriptor, then execs the requested command.
+- [x] Add a `sandbox` CLI command to launch commands under a workspace policy
+      and a `capabilities` command for host preflight information.
+- [x] Apply `PR_SET_NO_NEW_PRIVS` before installing restrictions.
+- [x] Apply Landlock path rules after no-new-privileges, using opened path
+      descriptors and requiring `FullyEnforced` status.
+- [x] Apply seccomp-bpf after Landlock. Compatibility mode denies selected
+      high-risk calls; opt-in syscall allowlists deny unlisted syscall numbers
+      and require `execve` so the helper can launch the command.
+- [x] Keep the order **no-new-privileges → Landlock → seccomp** explicit and
+      covered by tests/review; do not reorder these setup steps.
+- [x] Keep untrusted commands from starting until all required rules are active;
+      clear their inherited environment and close non-standard file descriptors.
+- [x] Fail closed when a required security control cannot be installed and
+      print the setup failure to stderr with helper exit code 125.
+- [x] Add disposable integration tests for workspace read/write, denied host
+      file access, denied socket creation, unaffected parent access, and child
+      termination when the async launch is cancelled; verify a workspace
+      symlink cannot expose a host file outside the Landlock boundary, and
+      verify explicit socket domains, syscall allowlists, and changed-path
+      identities enforce the configured policy.
+- [x] Add `CheckTask::sandboxed_command` so Linux orchestration checks run in
+      the helper, receive the disposable snapshot, and can read its source Git
+      objects through an explicit read-only Landlock rule.
+- [x] Configure explicit syscall allowlists and socket-domain policies; check
+      inherited standard descriptors for sockets when socket access is
+      restricted and provide stdin/stdout/stderr configuration.
+- [x] Test that policy grants for `.aws` and `.ssh` are rejected, including
+      `.ssh` when it is a symlink to credential storage.
+- [x] Verify an opened read-only path descriptor still identifies the original
+      directory after its pathname is renamed and replaced.
+- [x] Exercise deterministic replacement between gateway resolution and helper
+      opening; the helper checks device/inode identity and exits 125 on change.
+- [x] Add GitHub Actions coverage for x86_64 and arm64 on Ubuntu 24.04 and
+      26.04; each job runs format, tests, and Clippy.
+- [ ] Confirm successful hosted-runner results and record the kernels used.
+- [x] Document the kernel, configured-policy, and successful-rule-installation
+      dependencies, plus current syscall, network, and race-test limitations.
+
+**Current sandbox implementation:** `src/main.rs` exposes `sandbox` and
+`capabilities` commands. `src/sandbox.rs` launches a dedicated helper process,
+applies no-new-privileges → Landlock ABI V6 → seccomp, verifies Landlock reports
+full enforcement, then execs the requested command with a sanitized
+environment. `CheckTask::sandboxed_command` runs shell/tool checks through this
+path against the disposable snapshot. Integration tests on WSL2
+Linux 6.18 confirm workspace read/write, denial of `/etc/passwd` and socket
+creation, AF_UNIX-only socket creation, rejection of an unlisted syscall under
+an explicit allowlist, Git access through the explicitly granted read-only
+source object store, unchanged parent-process access, and process-group
+cleanup after cancellation. A delayed-helper test replaces a grant after the
+gateway opens it and verifies that a device/inode mismatch fails closed.
+Landlock enforces handled filesystem rights for granted paths. The default
+seccomp compatibility mode remains a targeted denylist; a strict,
+architecture-specific allowlist is opt-in and has no curated shell, Python, or
+Git profiles. Socket-domain rules govern socket creation, not destination
+addresses. Approved runtime paths (`/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`,
+dynamic-loader cache, and `/dev/null`) are available with limited permissions.
+Cross-kernel and cross-architecture integration remains unverified. Do not
+describe this as complete containment for arbitrary hostile native code.
+
+**Progress estimate: about 95%.** The enforcement path, configurable policy,
+CLI, orchestrator integration, tests, and security documentation are
+implemented. Remaining work is compatibility verification on additional Linux
+kernels and architectures through the new CI matrix. The workflow has not run
+yet, so cross-architecture compatibility is not confirmed.
+This estimate tracks the Kernel Sandbox feature only.
+
+### 3. Attestation and server bouncer — done (`feature/attestation`)
+
+- [x] Versioned canonical payload (`ksp-attestation v1`): tree OID, parent
+      OIDs, policy SHA-256, timestamp, key ID, and per-check outcome. Decoding
+      rejects any non-canonical bytes. Signature is domain-separated.
+- [x] Ed25519 keys via `ed25519-dalek` 2.x: OS randomness, `create_new` +
+      `0600`, load refuses group/other-readable files, no key in `Debug`.
+- [x] Sign locally only after every check passes (`gateway::pre_commit`);
+      a failed run deletes any stale pending attestation.
+- [x] Key enrollment = append `ksp-gateway keygen` output to the server's
+      trusted-keys file; revocation = `revoke <key-id>`. Rotation = add the new
+      key, then revoke the old one. Identity binding beyond the file label,
+      and recovery of a lost key (re-attest with a new key), are manual.
+- [x] `pre-receive` verifier (`src/bouncer.rs`): exactly one trailer, trusted
+      unrevoked key, payload key matches envelope key, tree and parents match
+      the commit, required checks present, optional allowed policy digests.
+      Reads pushed objects from Git's quarantine directory.
+- [x] Tests: tampered payload/signature, malformed envelopes, unknown/revoked/
+      mismatched keys, `--no-verify` then push, reused trailer on amended tree,
+      replay onto another parent, duplicate trailers, merges, deletions.
+- [x] Documented in README and `docs/THREAT_MODEL.md`.
+
+### 4. AI semantic firewall — heuristic layer done (`feature/semantic-firewall`)
+
+- [ ] **Research/deferred:** select and validate an offline model; confirm
+      Phi-3-mini/ONNX Runtime feasibility on the target hardware.
+- [ ] **Deferred:** integrate ONNX Runtime with `ort` behind the `Detector`
+      trait (sidecar protocol and lifecycle still to design).
+- [x] Changed content comes from the staged diff (`git diff --cached
+      --unified=0 --no-ext-diff --no-textconv`), with `GIT_INDEX_FILE` honored.
+- [x] Heuristic detection of instruction overrides, agent-addressed
+      directives, hidden Unicode (bidi, zero-width, tag characters), homoglyph
+      folding, base64-encoded instructions, pipe-to-shell, hook tampering,
+      credential exfiltration, and committed secrets (redacted in output).
+- [x] Bounded input (default 4 MiB, fails closed), per-line truncation, and a
+      findings cap; measured latency is in README.
+- [x] Policy decides blocking: `block` findings always block; warnings block
+      only with `block_on_warnings = true`. No model, so no model timeout yet.
+- [x] Tests for detections, benign false positives, evasions, and bounds.
+      Offline by construction (no network code).
+- [x] Labelled heuristic in code, README, and threat model.
+
+### 5. Integration, measurement, and delivery — done (`feature/integration`)
+
+- [x] `src/gateway.rs` integrates scanner → sandboxed command checks (via the
+      orchestrator, on a staged-index snapshot) → signing; `commit-msg` adds
+      the trailer only if tree and parents still match. CLI: `keygen`,
+      `pubkey`, `install`, `install-server`, `hook`, `check`, `reattest`,
+      `scan`, `verify-commit`, `pre-receive`, `policy`, `bench`.
+- [x] Orchestrator gained `SnapshotSource::StagedIndex` and
+      `CheckTask::with_index_file` so checks see exactly the commit content,
+      including `git commit -a`'s temporary index.
+- [x] Latency measured with `ksp-gateway bench` (release, WSL2 6.18,
+      i5-1135G7): 10.2 ms median for a 1-line change, 33.7 ms for a 290 KB /
+      7,849-line change, 54.4 ms with one sandboxed `/bin/true` check.
+- [x] `tests/end_to_end.rs`: real hooks + bare server: accepted push,
+      blocked injection, `--no-verify` rejected, reused trailer rejected then
+      fixed by `reattest`, revoked and unknown keys rejected, sandboxed staged
+      checks including `commit -a`, CLI reporting commands.
+- [x] CI exists; setup guide in README quick start and `docs/DEMO.md`.
+- [x] `docs/THREAT_MODEL.md` (guarantees, limits, bypass table) and
+      `docs/DEMO.md` (scripted demo, verified by running it on 2026-10-27).
+- [ ] Keep synopsis/presentation deliverables separate; implementation is the
+      priority in this repository.
+
+## Completion plan (2026-10-27)
+
+Phases 1–2 were ~95% done with 38 passing tests. The remaining phases are
+built test-first (write a failing unit/integration test, implement, refactor)
+on `feature/attestation`, branched from `feature/kernel-sandbox` at `7e0f7ec`
+because the sandbox is not yet merged into `develop`. Team review decides how
+it is integrated.
+
+| Step | Module | Deliverable | Tests first |
+|---|---|---|---|
+| A | `src/attestation.rs` | Versioned canonical payload bound to the staged tree OID and parents; Ed25519 key generation/storage (0600, outside the repo); sign/verify; commit-message trailer embed/extract; trust store with revocation | round-trip, tamper, wrong key, revoked key, malformed input, key-file permissions |
+| B | `src/bouncer.rs` | `pre-receive` verifier: enumerate pushed commits, verify signature, tree/parent binding, required checks, allowed policy digests, ref deletions | missing/invalid/tampered attestations, `--no-verify` commits, merges |
+| C | `src/scanner.rs` | Heuristic semantic firewall over added diff lines: agent-targeting instructions, hidden Unicode, pipe-to-shell, hook bypass, credential paths, secret material; bounded input; severity → block/warn | detections, benign false-positive cases, evasions, size bound |
+| D | `src/orchestrator.rs`, `src/policy.rs` | Staged-index snapshot mode so checks see exactly what will be committed; TOML gateway policy (checks, timeouts, scanner settings) with SHA-256 digest | staged vs unstaged content, policy parsing/validation |
+| E | `src/gateway.rs`, `src/main.rs` | `pre-commit` pipeline (scanner + secrets + sandboxed command checks via the orchestrator), signed pending attestation, `commit-msg` trailer, `install`, `keygen`, `verify-commit`, `pre-receive`, `scan`, `bench` | unit tests for pipeline decisions |
+| F | `tests/end_to_end.rs` | Real Git repos and a bare server with the hook: allowed push, rejected `--no-verify`, tampered message, wrong/revoked key, malicious diff blocked | — |
+| G | docs | README, tracker, threat model, demo script, latency method | — |
+
+The ONNX/`ort` model sidecar is deferred: it needs a downloaded model and
+cannot be validated tonight. Step C defines a `Detector` trait so a model
+backend can be added later; the shipped detector is heuristic only.
+
+## Decisions and implementation notes
+
+- **Feature branches:** Before starting each feature, create a new branch from
+  the latest `develop` (use names such as `feature/orchestrator` and
+  `feature/kernel-sandbox`). Do not silently base a feature on `main` or an
+  unrelated feature branch. Record the source commit and branch in this file.
+- **Integration:** Finish and verify the feature branch, then let the team review
+  and integrate it into `develop`. Start the next feature branch from the
+  updated `develop`. Do not integrate or publish changes without an explicit
+  team workflow decision.
+- **Tests:** Add tests as each module is implemented. Run `cargo fmt --check`,
+  `cargo test`, and suitable lint/integration checks for each feature and record
+  results below.
+- **Current lock implementation:** A short standard mutex protects an active
+  lock registry; a Tokio `Notify` wakes waiters. Shared locks coexist; exclusive
+  locks conflict with any overlapping path. `FileLockGuard::drop` removes the
+  active lock and wakes waiters. It is in-process coordination, not an OS lock.
+- **Current path model:** `FileLockManager::new(root)` canonicalizes an existing
+  directory root. Declared paths must not contain `..`; existing symlink
+  ancestors are canonicalized and the result must stay inside the root. Missing
+  leaf paths are allowed after resolving their nearest existing ancestor. The
+  constructor does not verify that the directory is a Git root. This check is
+  still vulnerable to external path changes after validation and is not a
+  sandbox boundary.
+- **Check resource model:** Callers declare paths with `FileAccess::read` or
+  `FileAccess::write`. Parent/child path overlap is treated as a conflict.
+  Duplicate and nested declarations within a check are collapsed, with write
+  access taking precedence. Undeclared file access is not detected.
+- **Timeout behavior:** `CheckTask::with_timeout` covers lock acquisition and
+  the check action. Expiry cancels the future and releases its acquired locks.
+- **Result behavior:** Results are ordered like submitted checks. Action errors
+  and panics become failed results. Dropping `run_checks` aborts child tasks;
+  the caller then has no completed result vector to inspect.
+- **Cancellation behavior:** A caller can clone `CheckTask::cancellation_handle`
+  before submission and call `cancel()`. Cancellation drops the Rust future,
+  yields `CheckStatus::Cancelled`, and releases acquired gateway locks. External
+  subprocesses spawned by an action need their own explicit child-process
+  cancellation and are not stopped automatically by dropping the Rust future.
+- **Snapshot behavior:** Each check gets a unique owner-only temporary
+  repository with private Git metadata and index, current bytes of tracked and
+  non-ignored untracked files, and hooks redirected to an empty private
+  directory. Source objects are borrowed read-only through Git alternates.
+  Ignored files and submodule contents are omitted; external symlinks fail
+  snapshot creation. Special index flags and custom filters/config are not
+  preserved. Snapshot write-back is not implemented, so check-generated
+  changes are thrown away when the check ends.
+- **Rust learning notes:** Ownership means one value controls its lifetime and
+  cleanup; the lock guard uses that rule to release access when it leaves
+  scope. `async` functions can suspend while waiting; Tokio runs those futures
+  so unrelated tasks can make progress.
+- **Sandbox process boundary:** The current Tokio runtime is not the place to
+  install per-thread Landlock/seccomp restrictions. A dedicated child starts
+  before Tokio, installs no-new-privileges, then Landlock, then seccomp, and
+  only then execs untrusted code. Its Landlock path descriptors are opened
+  first and held by owned `PathFd` values; dropping those values closes the
+  descriptors. The async launcher uses Tokio's child-process handle with
+  kill-on-drop, so cancelling the launch stops the helper/command process.
+  Preflight observations are not enforcement guarantees.
+
+## Current verification and handoff
+
+- `cargo fmt` — applied to the current Rust files.
+- `cargo test` — passed, 3 unit tests, 0 failures (2026-10-03).
+- `cargo test` — passed, 5 unit tests after initial scheduler work (2026-10-03).
+- `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test` (14 tests), and `git diff --check` — passed after repository
+  path validation, overlap-aware locks, cancellation, symlink handling, and an
+  isolated snapshot write/cleanup and ignored/untracked/deletion tests
+  (2026-10-19).
+- `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test` (14 tests), and `git diff --check` — passed after adding a
+  private snapshot Git index, staged/unstaged diff coverage, and candidate
+  patch reporting (2026-10-20).
+- `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test` (14 tests), and `git diff --check` — passed after making patches
+  baseline-relative and adding conflict preflight coverage (2026-10-20).
+- `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test` (17 tests), and `git diff --check` — passed after guarded apply,
+  stale-patch rejection, staged-index preservation, undeclared-write detection,
+  Unix hard-link rejection, and fail-closed index flag handling (2026-10-20).
+- `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test` (7 tests), and `git diff --check` — passed after the latest
+  scheduler changes (2026-10-03).
+- `cargo fmt`, `cargo test` (29 tests: 24 unit, 5 sandbox integration),
+  `cargo clippy --all-targets -- -D warnings`, and `git diff --check` — passed
+  after adding Landlock workspace-symlink and credential-path regression tests
+  to Linux child enforcement and orchestrator command checks on WSL2 kernel
+  6.18 (2026-10-23).
+- `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test` (30 tests: 25 unit, 5 sandbox integration), and
+  `git diff --check` — passed after verifying that a retained read-only
+  `PathFd` remains attached to its original directory when its pathname is
+  replaced (WSL2 Linux 6.18, 2026-10-24).
+- `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test` (31 tests: 25 unit, 6 sandbox integration), and
+  `git diff --check` — passed after documenting sandbox guarantees/limits and
+  verifying that `allow_network` permits socket creation (WSL2 Linux 6.18,
+  2026-10-24).
+- `cargo fmt --check`, `cargo test --locked -- --test-threads=1` (37 tests: 27
+  unit, 10 sandbox integration), `cargo clippy --all-targets -- -D warnings`,
+  and `git diff --check` — passed after adding explicit syscall allowlists,
+  socket-domain filtering, standard-stream configuration, deterministic
+  path-replacement rejection, and Linux CI matrix setup (WSL2 Linux 6.18,
+  2026-10-26).
+- `cargo fmt --check`, `cargo test --locked -- --test-threads=1` (38 tests: 27
+  unit, 11 sandbox integration), `cargo clippy --locked --all-targets -- -D
+  warnings`, and `git diff --check` — passed after adding and exercising the
+  local `sandbox` and `capabilities` CLI commands (WSL2 Linux 6.18, 2026-10-26).
+- Increased two scheduler test timeouts from 1s to 5s after full-suite runs on
+  WSL2 intermittently exceeded the original limits during snapshot creation.
+- `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`,
+  and `cargo test --locked -- --test-threads=1` (87 tests: 70 unit, 11 sandbox
+  integration, 6 end-to-end) — passed after adding attestation, the server
+  verifier, the semantic firewall, staged snapshots, policy, the gateway
+  pipeline, and CLI (WSL2 Linux 6.18, 2026-10-27). `docs/DEMO.md` was run
+  end to end against the release binary.
+- First CI run (2026-10-27) failed on all four runners, including the
+  pre-existing `feature/kernel-sandbox`: two sandbox tests ran `git`, and
+  GitHub-hosted images ship `/etc/gitconfig`, which Landlock denies; Git
+  treats an unreadable system config as fatal (exit 128). Fixed on
+  `feature/kernel-sandbox` by setting `GIT_CONFIG_NOSYSTEM=1` in the sandboxed
+  environment, with a regression test simulating the unreadable config; the
+  stacked branches were rebased onto the fix (88 tests pass locally).
+- Next tasks: push the stacked branches and confirm the Linux CI matrix passes
+  on x86_64/arm64 and both Ubuntu versions; team review and merge into
+  `develop`; decide whether to pursue the ONNX detector; consider protecting
+  the signing key from unsandboxed agents (hardware or agent-held keys).
+
+## How to resume
+
+1. Read this file and inspect `git status --short --branch`.
+2. Check `git branch --all` and confirm the feature base before starting work.
+3. Run `cargo test` to establish the current baseline.
+4. Continue the first unchecked item in the current phase, update its status,
+   add focused tests, and record any changed design decision here.
+5. Before a new feature, make a fresh branch from the latest `develop` as above.

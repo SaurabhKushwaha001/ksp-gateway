@@ -15,7 +15,7 @@ use ksp_gateway::{
     orchestrator::{
         CheckStatus, CheckTask, FileAccess, FileLockManager, IsolatedWorkspace, run_checks,
     },
-    sandbox::{PathAccess, PathRule, SandboxCommand, SandboxPolicy, SocketPolicy, SyscallPolicy},
+    sandbox::{PathAccess, PathRule, SandboxCommand, SandboxPolicy, SocketPolicy},
 };
 
 struct TemporaryDirectory(PathBuf);
@@ -275,7 +275,7 @@ async fn helper_fails_closed_if_a_granted_path_is_replaced_before_it_opens_it() 
 async fn explicit_syscall_allowlist_rejects_an_unlisted_syscall() {
     let temporary = TemporaryDirectory::new();
     let mut policy = SandboxPolicy::workspace_only(&temporary.0);
-    policy.syscall_policy = SyscallPolicy::Allowlist(BTreeSet::from([
+    policy.syscall_policy = ksp_gateway::sandbox::SyscallPolicy::Allowlist(BTreeSet::from([
         libc::SYS_access,
         libc::SYS_arch_prctl,
         libc::SYS_brk,

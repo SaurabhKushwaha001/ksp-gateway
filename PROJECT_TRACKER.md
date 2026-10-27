@@ -453,6 +453,13 @@ backend can be added later; the shipped detector is heuristic only.
   verifier, the semantic firewall, staged snapshots, policy, the gateway
   pipeline, and CLI (WSL2 Linux 6.18, 2026-10-27). `docs/DEMO.md` was run
   end to end against the release binary.
+- First CI run (2026-10-27) failed on all four runners, including the
+  pre-existing `feature/kernel-sandbox`: two sandbox tests ran `git`, and
+  GitHub-hosted images ship `/etc/gitconfig`, which Landlock denies; Git
+  treats an unreadable system config as fatal (exit 128). Fixed on
+  `feature/kernel-sandbox` by setting `GIT_CONFIG_NOSYSTEM=1` in the sandboxed
+  environment, with a regression test simulating the unreadable config; the
+  stacked branches were rebased onto the fix (88 tests pass locally).
 - Next tasks: push the stacked branches and confirm the Linux CI matrix passes
   on x86_64/arm64 and both Ubuntu versions; team review and merge into
   `develop`; decide whether to pursue the ONNX detector; consider protecting

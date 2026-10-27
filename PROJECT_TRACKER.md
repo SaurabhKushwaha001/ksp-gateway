@@ -14,10 +14,11 @@ developer, platform, or coding session can resume without relying on chat histor
 - **Working directory:** `/home/saurabhubuntu/ksp-gateway` (WSL2 / Ubuntu).
 - **Language/runtime:** Stable Rust, edition 2024; Tokio for async orchestration.
 - **Current toolchain observed:** `rustc 1.98.0`, `cargo 1.98.0`.
-- **Current branch:** `feature/kernel-sandbox`, created from updated `develop`
-  at `0bfb2e5` (orchestrator merge).
-- **Current Git status:** kernel sandbox implementation and tests are under
-  development on this feature branch; changes remain local and uncommitted.
+- **Current branch:** `feature/integration`, stacked on
+  `feature/semantic-firewall` → `feature/attestation` → `feature/kernel-sandbox`
+  (`7e0f7ec`). `develop` is still at `0bfb2e5` (orchestrator merge).
+- **Current Git status:** each phase is committed locally on its own stacked
+  branch; nothing has been pushed. Team review decides how they reach `develop`.
 
 ## Why this project exists
 
@@ -56,7 +57,7 @@ means the design or feasibility still needs validation.
 
 - [x] Minimal Rust project skeleton exists.
 - [x] Verify Rust/Cargo availability on the current WSL environment.
-- [ ] Add CI for formatting, linting, and tests.
+- [x] Add CI for formatting, linting, and tests (`.github/workflows/linux-sandbox.yml`).
 - [ ] Record supported Linux kernel/distribution requirements and crate versions.
 - [ ] Research Landlock ABI availability and seccomp behavior on supported WSL2
       kernels; document any WSL-specific limitations.
@@ -249,46 +250,68 @@ kernels and architectures through the new CI matrix. The workflow has not run
 yet, so cross-architecture compatibility is not confirmed.
 This estimate tracks the Kernel Sandbox feature only.
 
-### 3. Attestation and server bouncer — after sandbox
+### 3. Attestation and server bouncer — done (`feature/attestation`)
 
-- [ ] Define a versioned attestation payload (repository/commit identity,
-      check results, policy version, timestamp, and relevant digest data).
-- [ ] Generate/manage Ed25519 keys safely with `ed25519-dalek`; do not store a
-      private key in the repository or logs.
-- [ ] Sign locally only after required checks pass.
-- [ ] Define key enrollment, identity binding, rotation, revocation, and recovery.
-- [ ] Implement a Git server `pre-receive` hook that verifies signature,
-      payload binding, and policy, and rejects missing/invalid attestations.
-- [ ] Test tampered payloads, wrong keys, missing signatures, and bypass attempts
-      such as local `--no-verify` followed by push.
-- [ ] Document that server enforcement exists only where the hook and trust
-      configuration are installed.
+- [x] Versioned canonical payload (`ksp-attestation v1`): tree OID, parent
+      OIDs, policy SHA-256, timestamp, key ID, and per-check outcome. Decoding
+      rejects any non-canonical bytes. Signature is domain-separated.
+- [x] Ed25519 keys via `ed25519-dalek` 2.x: OS randomness, `create_new` +
+      `0600`, load refuses group/other-readable files, no key in `Debug`.
+- [x] Sign locally only after every check passes (`gateway::pre_commit`);
+      a failed run deletes any stale pending attestation.
+- [x] Key enrollment = append `ksp-gateway keygen` output to the server's
+      trusted-keys file; revocation = `revoke <key-id>`. Rotation = add the new
+      key, then revoke the old one. Identity binding beyond the file label,
+      and recovery of a lost key (re-attest with a new key), are manual.
+- [x] `pre-receive` verifier (`src/bouncer.rs`): exactly one trailer, trusted
+      unrevoked key, payload key matches envelope key, tree and parents match
+      the commit, required checks present, optional allowed policy digests.
+      Reads pushed objects from Git's quarantine directory.
+- [x] Tests: tampered payload/signature, malformed envelopes, unknown/revoked/
+      mismatched keys, `--no-verify` then push, reused trailer on amended tree,
+      replay onto another parent, duplicate trailers, merges, deletions.
+- [x] Documented in README and `docs/THREAT_MODEL.md`.
 
-### 4. AI semantic firewall — after attestation
+### 4. AI semantic firewall — heuristic layer done (`feature/semantic-firewall`)
 
-- [ ] Select and validate an offline model suitable for the available hardware;
-      confirm the Phi-3-mini/ONNX Runtime feasibility before locking the design.
-- [ ] Integrate ONNX Runtime with the `ort` crate and define a local sidecar
-      protocol and lifecycle.
-- [ ] Obtain changed content through Git diff handling coordinated by the spine.
-- [ ] Detect text that appears to instruct an AI agent to take unsafe actions.
-- [ ] Set resource limits and bound input sizes/model latency.
-- [ ] Make timeout/model failures explicit and define whether policy treats them
-      as warnings or blocks.
-- [ ] Test expected detections, benign false positives, evasions, and offline
-      operation.
-- [ ] Label results heuristic; never claim complete prompt-injection detection.
+- [ ] **Research/deferred:** select and validate an offline model; confirm
+      Phi-3-mini/ONNX Runtime feasibility on the target hardware.
+- [ ] **Deferred:** integrate ONNX Runtime with `ort` behind the `Detector`
+      trait (sidecar protocol and lifecycle still to design).
+- [x] Changed content comes from the staged diff (`git diff --cached
+      --unified=0 --no-ext-diff --no-textconv`), with `GIT_INDEX_FILE` honored.
+- [x] Heuristic detection of instruction overrides, agent-addressed
+      directives, hidden Unicode (bidi, zero-width, tag characters), homoglyph
+      folding, base64-encoded instructions, pipe-to-shell, hook tampering,
+      credential exfiltration, and committed secrets (redacted in output).
+- [x] Bounded input (default 4 MiB, fails closed), per-line truncation, and a
+      findings cap; measured latency is in README.
+- [x] Policy decides blocking: `block` findings always block; warnings block
+      only with `block_on_warnings = true`. No model, so no model timeout yet.
+- [x] Tests for detections, benign false positives, evasions, and bounds.
+      Offline by construction (no network code).
+- [x] Labelled heuristic in code, README, and threat model.
 
-### 5. Integration, measurement, and delivery
+### 5. Integration, measurement, and delivery — done (`feature/integration`)
 
-- [ ] Integrate the layers in the prescribed order without bypassing required
-      sandbox setup or server-side signature enforcement.
-- [ ] Measure local check latency and optimize toward the project target of
-      sub-100 ms where the check/model workload makes that feasible; state the
-      hardware, dataset, and measurement method.
-- [ ] Add end-to-end tests for allowed and rejected commit/push flows.
-- [ ] Add CI and a reproducible WSL2/Ubuntu setup guide.
-- [ ] Prepare threat model, known limitations, demo scenario, and recovery steps.
+- [x] `src/gateway.rs` integrates scanner → sandboxed command checks (via the
+      orchestrator, on a staged-index snapshot) → signing; `commit-msg` adds
+      the trailer only if tree and parents still match. CLI: `keygen`,
+      `pubkey`, `install`, `install-server`, `hook`, `check`, `reattest`,
+      `scan`, `verify-commit`, `pre-receive`, `policy`, `bench`.
+- [x] Orchestrator gained `SnapshotSource::StagedIndex` and
+      `CheckTask::with_index_file` so checks see exactly the commit content,
+      including `git commit -a`'s temporary index.
+- [x] Latency measured with `ksp-gateway bench` (release, WSL2 6.18,
+      i5-1135G7): 10.2 ms median for a 1-line change, 33.7 ms for a 290 KB /
+      7,849-line change, 54.4 ms with one sandboxed `/bin/true` check.
+- [x] `tests/end_to_end.rs`: real hooks + bare server: accepted push,
+      blocked injection, `--no-verify` rejected, reused trailer rejected then
+      fixed by `reattest`, revoked and unknown keys rejected, sandboxed staged
+      checks including `commit -a`, CLI reporting commands.
+- [x] CI exists; setup guide in README quick start and `docs/DEMO.md`.
+- [x] `docs/THREAT_MODEL.md` (guarantees, limits, bypass table) and
+      `docs/DEMO.md` (scripted demo, verified by running it on 2026-10-27).
 - [ ] Keep synopsis/presentation deliverables separate; implementation is the
       priority in this repository.
 
@@ -424,9 +447,16 @@ backend can be added later; the shipped detector is heuristic only.
   local `sandbox` and `capabilities` CLI commands (WSL2 Linux 6.18, 2026-10-26).
 - Increased two scheduler test timeouts from 1s to 5s after full-suite runs on
   WSL2 intermittently exceeded the original limits during snapshot creation.
-- Current sandbox code/doc changes are uncommitted on `feature/kernel-sandbox`.
-- Next task: confirm the Linux CI matrix passes on x86_64/arm64 and both Ubuntu
-  versions before claiming broader compatibility.
+- `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`,
+  and `cargo test --locked -- --test-threads=1` (87 tests: 70 unit, 11 sandbox
+  integration, 6 end-to-end) — passed after adding attestation, the server
+  verifier, the semantic firewall, staged snapshots, policy, the gateway
+  pipeline, and CLI (WSL2 Linux 6.18, 2026-10-27). `docs/DEMO.md` was run
+  end to end against the release binary.
+- Next tasks: push the stacked branches and confirm the Linux CI matrix passes
+  on x86_64/arm64 and both Ubuntu versions; team review and merge into
+  `develop`; decide whether to pursue the ONNX detector; consider protecting
+  the signing key from unsandboxed agents (hardware or agent-held keys).
 
 ## How to resume
 
